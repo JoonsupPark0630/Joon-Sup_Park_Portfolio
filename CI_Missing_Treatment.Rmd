@@ -1,0 +1,225 @@
+---
+title: "Causal Inference with Missing Treatments"
+author: "Joon Sup Park"
+date: "2023-01-29"
+output: pdf_document
+---
+
+```{r setup, message=F, warning=F, echo=F}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(glm2)
+library(PSweight)
+library(mvtnorm)
+library(rje)
+library(reshape2)
+library(gridExtra)
+
+library(rlist)
+
+library(factoextra)
+```
+
+```{r}
+generate_data <- function(n, p, sigma_sq){
+  W_mean = rep(0, p)
+  W_var = sigma_sq*diag(p)
+  W = rmvnorm(n = n, mean = W_mean, sigma = W_var)
+  return(W)
+}
+
+get_true_treatment <- function(W, n){
+  theta = rep(c(-1, 0.5, -0.25, -0.1), dim(W)[2]/4)
+  pi = expit(W %*% theta)
+  pi = rep(0.5, n)
+  Z = rbernoulli(n = n, p = pi)
+  return (Z)
+}
+
+get_true_outcome <- function(n, W, Z){
+  ATE_true = 20
+  # /4 is because we consider dimensions of W as multiples of 4
+  beta = c(210, rep(c(27.4, 13.7, 13.7, 13.7), dim(W)[2]/4), ATE_true)
+  eps = rnorm(n = n, mean = 0, sd = 1)
+  y = cbind(rep(1, n), W, Z) %*% beta + eps
+  return (y)
+}
+```
+
+
+```{r}
+set.seed(1652)
+
+n <- 10000
+p <- 4
+sigma_sq_X <- 5
+
+X <- generate_data(n, p, sigma_sq_X)
+Z <- get_true_treatment(X, n)
+y <- get_true_outcome(n, X, Z)
+
+X <- data.frame(X)
+X <- scale(X)
+```
+
+```{r}
+num_clusters <- 3000
+km <- kmeans(X, centers = num_clusters, nstart = 25)
+```
+
+```{r}
+df_y <- data.frame(cbind(y, km$cluster, Z))
+
+final_y <- data.frame()
+
+dropped = 0
+ATE_by_cluster <- cbind(rep(0, num_clusters), rep(0, num_clusters))
+for (k in 1:num_clusters){
+  if (nrow(df_y[df_y$V2 == k,]) > 2){
+    km_y_temp <- kmeans(df_y[df_y$V2 == k,], centers = 2, nstart = 25)
+    
+    df_y_temp <- data.frame(cbind(df_y[df_y$V2 == k,], km_y_temp$cluster))
+    
+    mean_y_temp_1 <- mean(df_y_temp$V1[df_y_temp$km_y_temp.cluster == 1])
+    mean_y_temp_2 <- mean(df_y_temp$V1[df_y_temp$km_y_temp.cluster == 2])
+    ATE_by_cluster[k,1] <- mean_y_temp_1 - mean_y_temp_2 
+    ATE_by_cluster[k,2] <- nrow(df_y[df_y$V2 == k,])
+    
+    if (ATE_by_cluster[k,1] >= 0){
+      df_y_temp$km_y_temp.cluster[df_y_temp$km_y_temp.cluster == 2] = 0
+    } else{
+      df_y_temp$km_y_temp.cluster[df_y_temp$km_y_temp.cluster == 1] = 0
+      df_y_temp$km_y_temp.cluster[df_y_temp$km_y_temp.cluster == 2] = 1
+    }
+    
+    final_y <- rbind(final_y, df_y_temp)
+  } else {
+    dropped = dropped + 1
+  }
+}
+```
+
+```{r}
+dropped
+```
+Sub-clustering based on y values does not work if the given cluster has less than 3 units. Thus, we drop a cluster when its size is less than 3.
+
+Obviously, the number of dropped clusters is increasing in the number of clusters. As the number of clusters increase, each cluster is more likely to have smaller size.
+
+Given the total sample size of n = 10000, the performance of algorithm, defined by how close the estimated ATE is to the true ATE, peaked when the number of clusters is km = 3000. For km < 3000, there was a room for improvement from finer binning of X's. For km > 3000, there was a room for improvement from increasing cluster size since: 1)small-sized clusters are less likely to have both Z = 1 units and Z = 0 units, leading to a systematic underestimation of the ATE; 2)clusters with size less than 3 get dropped, leading to waste of information.
+
+```{r}
+ATE_by_cluster <- data.frame(ATE_by_cluster)
+
+sum(abs(ATE_by_cluster$X1)*ATE_by_cluster$X2)/sum(ATE_by_cluster$X2)
+```
+
+```{r}
+nrow(final_y)
+nrow(final_y[final_y$Z == final_y$km_y_temp.cluster,])
+nrow(final_y[final_y$Z == final_y$km_y_temp.cluster,])/nrow(final_y)
+```
+Out of 8582 units, 5601 units have synthetic treatment values identical to true treatment values. This is 65.3%.
+
+
+```{r}
+
+get_ATE <- function(num_clusters){
+  km <- kmeans(X, centers = num_clusters, nstart = 25)
+  
+  df_y <- data.frame(cbind(y, km$cluster, Z))
+  colnames(df_y) <- c('y', 'X_clu', 'Z')
+  
+  final_y <- data.frame()
+  
+  dropped = 0
+  ATE_by_cluster <- cbind(rep(0, num_clusters), rep(0, num_clusters))
+  for (k in 1:num_clusters){
+    if (nrow(df_y[df_y$X_clu == k,]) > 2){
+      km_y_temp <- kmeans(df_y[df_y$X_clu == k,], centers = 2, nstart = 25)
+      
+      df_y_temp <- data.frame(cbind(df_y[df_y$X_clu == k,], km_y_temp$cluster))
+      colnames(df_y_temp) <- c('y', 'X_clu', 'Z', 'y_subclu')
+      
+      mean_y_temp_1 <- mean(df_y_temp$y[df_y_temp$y_subclu == 1])
+      mean_y_temp_2 <- mean(df_y_temp$y[df_y_temp$y_subclu == 2])
+      ATE_by_cluster[k,1] <- mean_y_temp_1 - mean_y_temp_2 
+      ATE_by_cluster[k,2] <- nrow(df_y[df_y[,2] == k,])
+      
+      if (ATE_by_cluster[k,1] >= 0){
+        df_y_temp$y_subclu[df_y_temp$y_subclu == 2] = 0
+      } else{
+        df_y_temp$y_subclu[df_y_temp$y_subclu == 1] = 0
+        df_y_temp$y_subclu[df_y_temp$y_subclu == 2] = 1
+      }
+      
+      final_y <- rbind(final_y, df_y_temp)
+    } else {
+      dropped = dropped + 1
+    }
+  }
+  
+  ATE_by_cluster <- data.frame(ATE_by_cluster)
+  colnames(ATE_by_cluster) <- c('ATE_clu', 'clu_size')
+  
+  ATE <- sum(abs(ATE_by_cluster$ATE)*ATE_by_cluster$clu_size)/sum(ATE_by_cluster$clu_size)
+  
+  colnames(final_y) <- c('y', 'X_clu', 'Z', 'y_subclu')
+  Z_right <- nrow(final_y[final_y$Z == final_y$y_subclu,])/nrow(final_y)  
+
+  ATE_summary <- data.frame(dropped, ATE, Z_right)
+  
+  ATE_list <- list(final_y, ATE_by_cluster, ATE_summary)
+  
+  return(ATE_list)
+}
+```
+
+
+```{r}
+set.seed(1652)
+
+n <- 100000
+p <- 8
+sigma_sq_X <- 5
+
+X <- generate_data(n, p, sigma_sq_X)
+Z <- get_true_treatment(X, n)
+y <- get_true_outcome(n, X, Z)
+
+X <- data.frame(X)
+X <- scale(X)
+```
+
+```{r}
+# num_clusters <- c(500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500)
+num_clusters <- c(30000)
+
+ATE_sim <- list()
+for(k in num_clusters){
+  ATE_list_k <- get_ATE(k)
+  ATE_sim <- list.append(ATE_sim, ATE_list_k)
+}
+
+```
+
+```{r}
+final_y <- ATE_sim[[1]][[1]]
+ATE_
+```
+
+```{r}
+mean(final_y$y[final_y$X_clu == 1 & final_y$y_subclu == 1]) - mean(final_y$y[final_y$X_clu == 1 & final_y$y_subclu == 0])
+
+mean(final_y$y[final_y$X_clu == 2 & final_y$y_subclu == 1]) - mean(final_y$y[final_y$X_clu == 2 & final_y$y_subclu == 0])
+```
+
+
+```{r}
+saveRDS(final_y, "X_clustered_y_100000sample.rds")
+saveRDS(df_ATE_by_cluster, "ATE_by_cluster_100000sample.rds")
+
+try = readRDS("ATE_by_cluster_100000sample.rds")
+sum(abs(try$X1)*try$X2)/sum(try$X2)
+```
