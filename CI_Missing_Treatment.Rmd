@@ -1,0 +1,428 @@
+---
+title: "Causal Inference with Missing Treatments"
+author: "Joon Sup Park"
+date: "2023-01-29"
+output: pdf_document
+---
+
+```{r setup, message=F, warning=F, echo=F}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(glm2)
+library(PSweight)
+library(mvtnorm)
+library(rje)
+library(reshape2)
+library(gridExtra)
+
+library(rlist)
+
+library(factoextra)
+```
+
+```{r}
+generate_X <- function(n, p, sigma_sq){
+  X_mean = rep(0, p)
+  X_var = sigma_sq*diag(p)
+  X = rmvnorm(n = n, mean = X_mean, sigma = X_var)
+  return(X)
+}
+
+generate_W <- function(X, n){
+  eta = rep(c(1, -0.25, 0.5, 0.1), ncol(X)/4)
+  ps = expit(X %*% eta)
+  W = rbernoulli(n = n, p = ps)
+  return(W)
+}
+
+generate_treatment <- function(X, n){
+  theta = c(rep(c(-1, 0.5, -0.25, -0.1), ncol(X)/4))
+  ps = expit(X %*% theta)
+  # pi = rep(0.5, n)
+  Z = rbernoulli(n = n, p = ps)
+  return(Z)
+}
+
+# generate_treatment <- function(X, W, n){
+#   theta = c(rep(c(-1, 0.5, -0.25, -0.1), ncol(X)/4), 3)
+#   ps = expit(cbind(X, W) %*% theta)
+#   # pi = rep(0.5, n)
+#   Z = rbernoulli(n = n, p = ps)
+#   return(Z)
+# }
+
+generate_outcome <- function(n, X, Z, sigma_sq_y){
+  ATE_true = 20
+  # /4 is because we consider dimensions of W as multiples of 4
+  beta = c(210, rep(c(27.4, 13.7, -10, 20), ncol(X)/4), ATE_true)
+  eps = rnorm(n = n, mean = 0, sd = sigma_sq_y)
+  y = cbind(rep(1, n), X, Z) %*% beta + eps
+  return(y)
+}
+```
+
+
+```{r}
+set.seed(2024)
+
+n <- 10000
+p <- 16
+sigma_sq_X <- 5
+sigma_sq_y <- 5
+
+X <- generate_X(n, p, sigma_sq_X)
+W <- generate_W(X, n)
+# Z <- generate_treatment(X, W, n)
+Z <- generate_treatment(X, n)
+y <- generate_outcome(n, X, Z, sigma_sq_y)
+
+X_df <- data.frame(X)
+```
+
+```{r}
+# X <- scale(X)
+
+rep1_X <- cbind(rep(1, n), X)
+
+df <- data.frame(y, X_df, Z)
+
+lm_true <- lm(y ~ 1 + ., df)
+lm_true$coefficients
+
+df_no_Z <- subset(df, select = -c(Z))
+lm <- lm(y ~ 1 + ., df_no_Z)
+lm$coefficients
+res <- lm$residuals
+
+km_res <- kmeans(res, centers = 2, nstart = 25)
+
+df_clu <- data.frame(df, km_res$cluster)
+colnames(df_clu)[colnames(df_clu) == 'km_res.cluster'] <- 'res_clu'
+
+# Convert synthetic Z values from {1, 2} to {0, 1}
+df_clu$res_clu[df_clu$res_clu == 1] <- 0
+df_clu$res_clu[df_clu$res_clu == 2] <- 1
+if(nrow(df_clu[df_clu$Z == df_clu$res_clu,])/nrow(df_clu) < 0.5){
+  df_clu$res_clu[df_clu$res_clu == 0] <- 2
+  df_clu$res_clu[df_clu$res_clu == 1] <- 0
+  df_clu$res_clu[df_clu$res_clu == 2] <- 1
+}
+
+# Check how many true Z = 1
+nrow(df_clu[df_clu$Z == 1, ])
+# Check how many synthetic Z = 1
+nrow(df_clu[df_clu$res_clu == 1, ])
+# Check how many synthetic Z correspond to true Z
+nrow(df_clu[df_clu$Z == df_clu$res_clu,])/nrow(df_clu)
+
+# Run outcome model-based regression of y on X and synthetic Z
+df_clu_no_Z <- subset(df_clu, select = -c(Z))
+lm2 <- lm(y ~ 1 + ., df_clu_no_Z)
+lm2$coefficients
+
+
+# Obtain better estimates of Z and ATE by repeating the procedure. If the first estimate of Z is good enough, then the second estimates of the coefficients of X's, i.e., beta, would be better than the first estimates of beta. Then the difference y - Xb_2 would have purer information of Z than the difference y - Xb_1.
+rep1_X_coef_temp <- lm2$coefficients[0:p+1]
+y_pred_temp <- rep1_X %*% rep1_X_coef_temp
+res_temp <- y - y_pred_temp
+
+hist(res_temp, breaks = 50)
+
+# Form a new synthetic Z by clustering the residuals into two
+km_res_temp <- kmeans(res_temp, centers = 2, nstart = 25)
+
+# Form a data frame with y, X, and new synthetic Z
+df_clu_temp <- data.frame(df, km_res_temp$cluster)
+colnames(df_clu_temp)[colnames(df_clu_temp) == 'km_res_temp.cluster'] <- 'res_clu'
+
+# Convert synthetic Z values from {1, 2} to {0, 1}
+df_clu_temp$res_clu[df_clu_temp$res_clu == 1] <- 0
+df_clu_temp$res_clu[df_clu_temp$res_clu == 2] <- 1
+if(nrow(df_clu_temp[df_clu_temp$Z == df_clu_temp$res_clu,]) /
+  nrow(df_clu_temp) < 0.5){
+  df_clu_temp$res_clu[df_clu_temp$res_clu == 0] <- 2
+  df_clu_temp$res_clu[df_clu_temp$res_clu == 1] <- 0
+  df_clu_temp$res_clu[df_clu_temp$res_clu == 2] <- 1
+}
+
+nrow(df_clu_temp[df_clu_temp$Z == df_clu_temp$res_clu,])/nrow(df_clu_temp)
+
+# Run outcome model-based regression of y on X AND synthetic Z
+df_clu_temp_no_Z <- subset(df_clu_temp, select = -c(Z))
+lm_temp <- lm(y ~ 1 + ., df_clu_temp_no_Z)
+lm_temp$coefficients
+
+
+
+
+# Iterative algorithms to obtain less biased estimate of the coefficients of X, B, upon which we obtain less biased estimate of synthetic Z
+threshold <- 0.1
+
+rep1_X_coef_prev <- lm$coefficients[0:p+1]
+rep1_X_coef_temp <- lm2$coefficients[0:p+1]
+y_pred_temp <- rep1_X %*% rep1_X_coef_temp
+res_temp <- y - y_pred_temp
+while(norm(as.matrix(rep1_X_coef_temp) - as.matrix(rep1_X_coef_prev)) > threshold){
+  # Form a new synthetic Z by clustering the residuals into two 
+  km_res_temp <- kmeans(res_temp, centers = 2, nstart = 25)
+  
+  # Form a data frame with y, X, and new synthetic Z
+  df_clu_temp <- data.frame(df, km_res_temp$cluster)
+  colnames(df_clu_temp)[colnames(df_clu_temp) == 'km_res_temp.cluster'] <- 'res_clu'
+
+  # Convert synthetic Z values from {1, 2} to {0, 1}
+  df_clu_temp$res_clu[df_clu_temp$res_clu == 1] <- 0
+  df_clu_temp$res_clu[df_clu_temp$res_clu == 2] <- 1
+  if(nrow(df_clu_temp[df_clu_temp$Z == df_clu_temp$res_clu,]) / 
+   nrow(df_clu_temp) < 0.5){
+    df_clu_temp$res_clu[df_clu_temp$res_clu == 0] <- 2
+    df_clu_temp$res_clu[df_clu_temp$res_clu == 1] <- 0
+    df_clu_temp$res_clu[df_clu_temp$res_clu == 2] <- 1
+  }
+  
+  # Store the previous coefficients for intercept and X
+  rep1_X_coef_prev <- rep1_X_coef_temp
+
+  # Run outcome model-based regression of y on X AND synthetic Z
+  df_clu_temp_no_Z <- subset(df_clu_temp, select = -c(Z))
+  lm_temp <- lm(y ~ 1 + ., df_clu_temp_no_Z)
+  # Store new coefficients for intercept and X
+  rep1_X_coef_temp <- lm_temp$coefficients[0:p+1]
+  # Store new predicted y only based on intercept and X, i.e., XB
+  y_pred_temp <- rep1_X %*% rep1_X_coef_temp
+  # Store the new residuals
+  res_temp <- y - y_pred_temp
+}
+
+# Check how many true Z = 1
+nrow(df_clu_temp[df_clu_temp$Z == 1, ])
+# Check how many synthetic Z = 1
+nrow(df_clu_temp[df_clu_temp$res_clu == 1, ])
+# Check how many synthetic Z correspond to true Z
+nrow(df_clu_temp[df_clu_temp$Z == df_clu_temp$res_clu,])/nrow(df_clu_temp)
+
+lm_temp$coefficients
+```
+```{r}
+check <- data.frame(df_clu_temp$res_clu, W)
+colnames(check)[colnames(check) == 'df_clu_temp.res_clu'] <- 'res_clu'
+nrow(check[check$W == check$res_clu,])/nrow(check)
+
+nrow(check[check$W == 1 & check$res_clu == 1,])/nrow(check[check$W == 1,])
+nrow(check[check$W == 1 & check$res_clu == 0,])/nrow(check[check$W == 1,])
+nrow(check[check$W == 0 & check$res_clu == 0,])/nrow(check[check$W == 0,])
+nrow(check[check$W == 0 & check$res_clu == 1,])/nrow(check[check$W == 1,])
+
+df_ps <- data.frame(subset(df_clu_temp, select = -c(y, Z)), W)
+glm_ps = glm(formula = res_clu ~ 0 + ., 
+             family = binomial(link = "logit"), 
+             data = df_ps)
+glm_ps$coefficients
+```
+
+
+
+
+```{r}
+hist(res, breaks = 50)
+```
+
+```{r}
+hist(res_temp, breaks = 50)
+```
+
+```{r}
+plot(res_temp)
+```
+
+
+
+
+```{r}
+# ATE and ATO based on synthetic propensity score
+
+# Obtain propensity score based on logistic regression of synthetic Z on X
+df_clu_no_Z_no_y <- subset(df_clu_no_Z, select = -c(y))
+glm_ps = glm(formula = res_clu ~ 0 + ., 
+             family = binomial(link = "logit"), 
+             data = df_clu_no_Z_no_y)
+ps = predict(glm_ps, type = "response")
+
+df_clu_ps <- data.frame(df_clu, ps)
+
+ATE_PS = sum(df_clu_ps$res_clu * df_clu_ps$y / df_clu_ps$ps) / 
+ sum(df_clu_ps$res_clu / df_clu_ps$ps) - 
+  sum((1 - df_clu_ps$res_clu) * df_clu_ps$y / (1 - df_clu_ps$ps)) / 
+  sum((1 - df_clu_ps$res_clu)/(1 - df_clu_ps$ps))
+ATE_PS
+
+ATO_PS = sum(df_clu_ps$res_clu * df_clu_ps$y * (1 - df_clu_ps$ps)) / sum(df_clu_ps$res_clu * (1 - df_clu_ps$ps)) - 
+  sum((1 - df_clu_ps$res_clu) * df_clu_ps$y * df_clu_ps$ps) / 
+  sum((1 - df_clu_ps$res_clu) * df_clu_ps$ps)
+ATO_PS
+```
+```{r}
+plot(res)
+hist(res)
+```
+
+```{r}
+get_ATE <- function(num_clusters){
+  km <- kmeans(X, centers = num_clusters, nstart = 25)
+  
+  df_y <- data.frame(cbind(y, km$cluster, Z))
+  colnames(df_y) <- c('y', 'X_clu', 'Z')
+  
+  final_y <- data.frame()
+  
+  dropped = 0
+  ATE_by_cluster <- cbind(rep(0, num_clusters), rep(0, num_clusters))
+  for (k in 1:num_clusters){
+    if (nrow(df_y[df_y$X_clu == k,]) > 2){
+      km_y_temp <- kmeans(df_y[df_y$X_clu == k,], centers = 2, nstart = 25)
+      
+      df_y_temp <- data.frame(cbind(df_y[df_y$X_clu == k,], km_y_temp$cluster))
+      colnames(df_y_temp) <- c('y', 'X_clu', 'Z', 'y_subclu')
+      
+      mean_y_temp_1 <- mean(df_y_temp$y[df_y_temp$y_subclu == 1])
+      mean_y_temp_2 <- mean(df_y_temp$y[df_y_temp$y_subclu == 2])
+      ATE_by_cluster[k,1] <- mean_y_temp_1 - mean_y_temp_2 
+      ATE_by_cluster[k,2] <- nrow(df_y[df_y[,2] == k,])
+      
+      if (ATE_by_cluster[k,1] >= 0){
+        df_y_temp$y_subclu[df_y_temp$y_subclu == 2] = 0
+      } else{
+        df_y_temp$y_subclu[df_y_temp$y_subclu == 1] = 0
+        df_y_temp$y_subclu[df_y_temp$y_subclu == 2] = 1
+      }
+      
+      final_y <- rbind(final_y, df_y_temp)
+    } else {
+      dropped = dropped + 1
+    }
+  }
+  
+  ATE_by_cluster <- data.frame(ATE_by_cluster)
+  colnames(ATE_by_cluster) <- c('ATE_clu', 'clu_size')
+  
+  ATE <- sum(abs(ATE_by_cluster$ATE)*ATE_by_cluster$clu_size)/sum(ATE_by_cluster$clu_size)
+  
+  colnames(final_y) <- c('y', 'X_clu', 'Z', 'y_subclu')
+  Z_right <- nrow(final_y[final_y$Z == final_y$y_subclu,])/nrow(final_y)  
+
+  ATE_summary <- data.frame(dropped, ATE, Z_right)
+  
+  ATE_list <- list(final_y, ATE_by_cluster, ATE_summary)
+  
+  return(ATE_list)
+}
+```
+
+```{r}
+# num_clusters <- c(500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500)
+num_clusters <- c(3000)
+
+ATE_sim <- list()
+for(k in num_clusters){
+  ATE_list_k <- get_ATE(k)
+  ATE_sim <- list.append(ATE_sim, ATE_list_k)
+}
+
+```
+
+```{r}
+final_y <- ATE_sim[[1]][[1]]
+ATE_by_cluster <- ATE_sim[[1]][[2]]
+ATE_summary <- ATE_sim[[1]][[3]]
+```
+
+```{r}
+mean(final_y$y[final_y$X_clu == 1 & final_y$y_subclu == 1]) - mean(final_y$y[final_y$X_clu == 1 & final_y$y_subclu == 0])
+
+mean(final_y$y[final_y$X_clu == 2 & final_y$y_subclu == 1]) - mean(final_y$y[final_y$X_clu == 2 & final_y$y_subclu == 0])
+```
+
+
+```{r}
+saveRDS(final_y, "X_clustered_y_100000sample.rds")
+saveRDS(df_ATE_by_cluster, "ATE_by_cluster_100000sample.rds")
+
+try = readRDS("ATE_by_cluster_100000sample.rds")
+sum(abs(try$X1)*try$X2)/sum(try$X2)
+```
+
+
+```{r}
+set.seed(1652)
+
+n <- 10000
+p <- 4
+sigma_sq_X <- 5
+
+X <- generate_X(n, p, sigma_sq_X)
+Z <- generate_treatment(X, n)
+y <- generate_outcome(n, X, Z)
+
+X <- data.frame(X)
+X <- scale(X)
+```
+
+```{r}
+num_clusters <- 3000
+km <- kmeans(X, centers = num_clusters, nstart = 25)
+```
+
+```{r}
+df_y <- data.frame(cbind(y, km$cluster, Z))
+
+final_y <- data.frame()
+
+dropped = 0
+ATE_by_cluster <- cbind(rep(0, num_clusters), rep(0, num_clusters))
+for (k in 1:num_clusters){
+  if (nrow(df_y[df_y$V2 == k,]) > 2){
+    km_y_temp <- kmeans(df_y[df_y$V2 == k,], centers = 2, nstart = 25)
+    
+    df_y_temp <- data.frame(cbind(df_y[df_y$V2 == k,], km_y_temp$cluster))
+    
+    mean_y_temp_1 <- mean(df_y_temp$V1[df_y_temp$km_y_temp.cluster == 1])
+    mean_y_temp_2 <- mean(df_y_temp$V1[df_y_temp$km_y_temp.cluster == 2])
+    ATE_by_cluster[k,1] <- mean_y_temp_1 - mean_y_temp_2 
+    ATE_by_cluster[k,2] <- nrow(df_y[df_y$V2 == k,])
+    
+    if (ATE_by_cluster[k,1] >= 0){
+      df_y_temp$km_y_temp.cluster[df_y_temp$km_y_temp.cluster == 2] = 0
+    } else{
+      df_y_temp$km_y_temp.cluster[df_y_temp$km_y_temp.cluster == 1] = 0
+      df_y_temp$km_y_temp.cluster[df_y_temp$km_y_temp.cluster == 2] = 1
+    }
+    
+    final_y <- rbind(final_y, df_y_temp)
+  } else {
+    dropped = dropped + 1
+  }
+}
+```
+
+```{r}
+dropped
+```
+Sub-clustering based on y values does not work if the given cluster has less than 3 units. Thus, we drop a cluster when its size is less than 3.
+
+Obviously, the number of dropped clusters is increasing in the number of clusters. As the number of clusters increase, each cluster is more likely to have smaller size.
+
+Given the total sample size of n = 10000, the performance of algorithm, defined by how close the estimated ATE is to the true ATE, peaked when the number of clusters is km = 3000. For km < 3000, there was a room for improvement from finer binning of X's. For km > 3000, there was a room for improvement from increasing cluster size since: 1)small-sized clusters are less likely to have both Z = 1 units and Z = 0 units, leading to a systematic underestimation of the ATE; 2)clusters with size less than 3 get dropped, leading to waste of information.
+
+```{r}
+ATE_by_cluster <- data.frame(ATE_by_cluster)
+
+sum(abs(ATE_by_cluster$X1)*ATE_by_cluster$X2)/sum(ATE_by_cluster$X2)
+```
+
+```{r}
+nrow(final_y)
+nrow(final_y[final_y$Z == final_y$km_y_temp.cluster,])
+nrow(final_y[final_y$Z == final_y$km_y_temp.cluster,])/nrow(final_y)
+```
+Out of 8582 units, 5601 units have synthetic treatment values identical to true treatment values. This is 65.3%.
